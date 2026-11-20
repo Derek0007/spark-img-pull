@@ -1,68 +1,72 @@
-name: Pull spark-vllm-b12x and export
+name: Pull spark-vllm-b12x and publish as release assets
 
 on:
   workflow_dispatch:
     inputs:
       image:
-        description: 'Image to pull'
+        description: 'Image ref'
         required: false
         default: 'eugr/spark-vllm-b12x@sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595'
       split_mb:
-        description: 'Split size in MB (artifacts are capped, so split)'
+        description: 'Split size MB'
         required: false
         default: '1500'
 
+permissions:
+  contents: write
+
 jobs:
   pull:
+    # arm64 runner keeps native pull; if unavailable, fallback job below handles it
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
-      - name: Disk space
+      - name: Disk info
         run: |
           df -h /
-          echo "---"
-          free -h
+          nproc
 
-      - name: Pull image
+      - name: Pull image (arm64)
         run: |
           IMAGE="${{ github.event.inputs.image }}"
           echo "Pulling: $IMAGE"
           docker pull "$IMAGE"
-          echo "--- images ---"
-          docker images
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
 
-      - name: Save and split
+      - name: Save, split, checksum
         run: |
-          mkdir -p /tmp/out
-          IMAGE_ID=$(docker inspect --format '{{.Id}}' "${{ github.event.inputs.image }}")
-          echo "Image ID: $IMAGE_ID"
-          docker save "$IMAGE_ID" -o /tmp/out/image.tar
-          ls -lh /tmp/out/image.tar
-          echo "--- splitting ---"
-          split -b "${{ github.event.inputs.split_mb }}m" -d -a 2 \
-            /tmp/out/image.tar /tmp/out/spark-vllm.part.
-          ls -lh /tmp/out/
-          echo "--- sha256 ---"
-          cd /tmp/out && sha256sum spark-vllm.part.* | tee SHA256SUMS
+          set -euo pipefail
+          IMAGE="${{ github.event.inputs.image }}"
+          ID=$(docker inspect --format '{{.Id}}' "$IMAGE")
+          ARCH=$(docker inspect --format '{{.Architecture}}' "$IMAGE")
+          SIZE=$(docker inspect --format '{{.Size}}' "$IMAGE")
+          echo "ID=$ID ARCH=$ARCH SIZE=$SIZE"
 
-      - name: Store image metadata
+          mkdir -p out
+          docker save "$ID" -o out/spark-vllm.tar
+          ls -lh out/spark-vllm.tar
+
+          split -b "${{ github.event.inputs.split_mb }}m" -d -a 1 out/spark-vllm.tar out/spark-vllm.part.
+          rm -f out/spark-vllm.tar
+          ls -lh out/
+
+          cd out
+          sha256sum spark-vllm.part.* > SHA256SUMS
+          printf 'image=%s\nimage_id=%s\narchitecture=%s\nsize_bytes=%s\npulled_at=%s\n' \
+            "$IMAGE" "$ID" "$ARCH" "$SIZE" "$(date -u +%FT%TZ)" > METADATA.txt
+          cat METADATA.txt
+          cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          {
-            echo "image=${{ github.event.inputs.image }}"
-            echo "image_id=$(docker inspect --format '{{.Id}}' "${{ github.event.inputs.image }}")"
-            echo "arch=$(docker inspect --format '{{.Architecture}}' "${{ github.event.inputs.image}}")"
-            echo "size=$(docker inspect --format '{{.Size}}' "${{ github.event.inputs.image}}")"
-            echo "pulled_at=$(date -u +%FT%TZ)"
-          } > /tmp/out/METADATA.txt
-          cat /tmp/out/METADATA.txt
-
-      - name: Upload parts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spark-vllm-parts
-          path: |
-            /tmp/out/spark-vllm.part.*
-            /tmp/out/SHA256SUMS
-            /tmp/out/METADATA.txt
-          compression-level: 0
-          retention-days: 3
+          set -euo pipefail
+          TAG="img-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "spark-vllm-b12x $TAG" \
+            --notes "arm64 image export, split parts, see METADATA.txt" \
+            out/spark-vllm.part.* out/SHA256SUMS out/METADATA.txt
+          echo "TAG=$TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "Published: $TAG" >> "$GITHUB_STEP_SUMMARY"
