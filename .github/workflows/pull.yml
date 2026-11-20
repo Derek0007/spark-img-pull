@@ -1,0 +1,68 @@
+name: Pull spark-vllm-b12x and export
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Image to pull'
+        required: false
+        default: 'eugr/spark-vllm-b12x@sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595'
+      split_mb:
+        description: 'Split size in MB (artifacts are capped, so split)'
+        required: false
+        default: '1500'
+
+jobs:
+  pull:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - name: Disk space
+        run: |
+          df -h /
+          echo "---"
+          free -h
+
+      - name: Pull image
+        run: |
+          IMAGE="${{ github.event.inputs.image }}"
+          echo "Pulling: $IMAGE"
+          docker pull "$IMAGE"
+          echo "--- images ---"
+          docker images
+
+      - name: Save and split
+        run: |
+          mkdir -p /tmp/out
+          IMAGE_ID=$(docker inspect --format '{{.Id}}' "${{ github.event.inputs.image }}")
+          echo "Image ID: $IMAGE_ID"
+          docker save "$IMAGE_ID" -o /tmp/out/image.tar
+          ls -lh /tmp/out/image.tar
+          echo "--- splitting ---"
+          split -b "${{ github.event.inputs.split_mb }}m" -d -a 2 \
+            /tmp/out/image.tar /tmp/out/spark-vllm.part.
+          ls -lh /tmp/out/
+          echo "--- sha256 ---"
+          cd /tmp/out && sha256sum spark-vllm.part.* | tee SHA256SUMS
+
+      - name: Store image metadata
+        run: |
+          {
+            echo "image=${{ github.event.inputs.image }}"
+            echo "image_id=$(docker inspect --format '{{.Id}}' "${{ github.event.inputs.image }}")"
+            echo "arch=$(docker inspect --format '{{.Architecture}}' "${{ github.event.inputs.image}}")"
+            echo "size=$(docker inspect --format '{{.Size}}' "${{ github.event.inputs.image}}")"
+            echo "pulled_at=$(date -u +%FT%TZ)"
+          } > /tmp/out/METADATA.txt
+          cat /tmp/out/METADATA.txt
+
+      - name: Upload parts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spark-vllm-parts
+          path: |
+            /tmp/out/spark-vllm.part.*
+            /tmp/out/SHA256SUMS
+            /tmp/out/METADATA.txt
+          compression-level: 0
+          retention-days: 3
