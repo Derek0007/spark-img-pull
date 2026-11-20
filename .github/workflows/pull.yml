@@ -10,50 +10,53 @@ on:
       split_mb:
         description: 'Split size MB'
         required: false
-        default: '1500'
+        default: '1900'
 
 permissions:
   contents: write
 
 jobs:
   pull:
-    # arm64 runner keeps native pull; if unavailable, fallback job below handles it
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     steps:
-      - name: Disk info
+      - name: Free disk space first
         run: |
+          echo "--- before ---"
           df -h /
-          nproc
+          # Remove preinstalled toolchains we do not need (frees ~25-30 GB)
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+          echo "--- after ---"
+          df -h /
 
-      - name: Pull image (arm64)
+      - name: Pull image (arm64, pipe to file, no docker storage)
         run: |
+          set -euo pipefail
           IMAGE="${{ github.event.inputs.image }}"
           echo "Pulling: $IMAGE"
           docker pull "$IMAGE"
           docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+          df -h /
 
-      - name: Save, split, checksum
+      - name: Save to file and split on the fly
         run: |
           set -euo pipefail
           IMAGE="${{ github.event.inputs.image }}"
           ID=$(docker inspect --format '{{.Id}}' "$IMAGE")
           ARCH=$(docker inspect --format '{{.Architecture}}' "$IMAGE")
-          SIZE=$(docker inspect --format '{{.Size}}' "$IMAGE")
-          echo "ID=$ID ARCH=$ARCH SIZE=$SIZE"
-
+          echo "ID=$ID ARCH=$ARCH"
           mkdir -p out
-          docker save "$ID" -o out/spark-vllm.tar
-          ls -lh out/spark-vllm.tar
-
-          split -b "${{ github.event.inputs.split_mb }}m" -d -a 1 out/spark-vllm.tar out/spark-vllm.part.
-          rm -f out/spark-vllm.tar
+          # Pipe docker save straight into split: no intermediate 18GB file
+          docker save "$ID" | split -b "${{ github.event.inputs.split_mb }}m" -d -a 1 - out/spark-vllm.part.
+          df -h /
           ls -lh out/
-
           cd out
           sha256sum spark-vllm.part.* > SHA256SUMS
-          printf 'image=%s\nimage_id=%s\narchitecture=%s\nsize_bytes=%s\npulled_at=%s\n' \
-            "$IMAGE" "$ID" "$ARCH" "$SIZE" "$(date -u +%FT%TZ)" > METADATA.txt
+          printf 'image=%s\nimage_id=%s\narchitecture=%s\npulled_at=%s\n' \
+            "$IMAGE" "$ID" "$ARCH" "$(date -u +%FT%TZ)" > METADATA.txt
           cat METADATA.txt
           cat SHA256SUMS
 
@@ -66,7 +69,7 @@ jobs:
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "spark-vllm-b12x $TAG" \
-            --notes "arm64 image export, split parts, see METADATA.txt" \
+            --notes "arm64 image export (split parts). See METADATA.txt and SHA256SUMS." \
             out/spark-vllm.part.* out/SHA256SUMS out/METADATA.txt
-          echo "TAG=$TAG" >> "$GITHUB_STEP_SUMMARY"
-          echo "Published: $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Published release: $TAG" >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[] | "\(.name) \(.size)"'
