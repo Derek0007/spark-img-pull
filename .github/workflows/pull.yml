@@ -8,7 +8,7 @@ on:
         required: false
         default: 'eugr/spark-vllm-b12x@sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595'
       split_mb:
-        description: 'Split size MB (Release asset cap is 2048)'
+        description: 'Split size MB (Release asset cap 2048)'
         required: false
         default: '1800'
 
@@ -20,64 +20,91 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     steps:
-      - name: Free disk space
+      - name: Inspect storage layout
         run: |
-          echo "--- before ---"
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
-                      /usr/local/lib/node_modules /opt/microsoft 2>/dev/null || true
-          sudo apt-get clean || true
-          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb 2>/dev/null || true
-          echo "--- after ---"
+          echo "=== mounts ==="
+          df -h
+          echo
+          echo "=== docker root ==="
+          docker info --format '{{.DockerRootDir}}'
+          echo "=== /mnt ==="
+          ls -la /mnt 2>/dev/null || true
+
+      - name: Maximize free space
+        run: |
+          set -x
+          # Large preinstalled toolchains shipped on GH runners
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf /opt/microsoft
+          sudo rm -rf /usr/lib/jvm
+          sudo rm -rf /usr/local/aws-cli
+          sudo rm -rf /usr/local/aws
+          sudo rm -rf /opt/pipx
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/share/swift
+          # Package caches
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo rm -rf /var/cache/apt/archives/*.deb
+          # Drop any preloaded docker images
+          docker image prune -af || true
+          docker builder prune -af || true
+          echo "=== after cleanup ==="
           df -h /
 
       - name: Pull image (arm64)
         run: |
           set -euo pipefail
           IMAGE="${{ github.event.inputs.image }}"
-          echo "Pulling: $IMAGE"
           docker pull "$IMAGE"
           docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
           df -h /
 
-      - name: Save | gzip | split  (streamed, needs ~half the disk)
+      - name: Export streamed -> gzip -> split
         run: |
           set -euo pipefail
           IMAGE="${{ github.event.inputs.image }}"
           ID=$(docker inspect --format '{{.Id}}' "$IMAGE")
           ARCH=$(docker inspect --format '{{.Architecture}}' "$IMAGE")
           echo "ID=$ID ARCH=$ARCH"
-          echo "--- disk before save ---"
           df -h /
 
-          mkdir -p out
-          # gzip -1 keeps it fast; split at 1800m stays under the 2 GiB asset cap
-          docker save "$ID" | gzip -1 | split -b "${{ github.event.inputs.split_mb }}m" -d -a 1 - out/spark-vllm.part.
+          mkdir -p "$RUNNER_TEMP/out"
+          OUT="$RUNNER_TEMP/out"
+          echo "Writing parts to: $OUT"
 
-          echo "--- after ---"
+          # Stream: save | gzip(-1) | split. Peak disk = docker image + compressed parts only.
+          docker save "$ID" | gzip -1 | split -b "${{ github.event.inputs.split_mb }}m" -d -a 1 - "$OUT/spark-vllm.part."
+
           df -h /
-          ls -lh out/
-          cd out
+          ls -lh "$OUT"
+          cd "$OUT"
           sha256sum spark-vllm.part.* > SHA256SUMS
-          printf 'image=%s\nimage_id=%s\narchitecture=%s\ncompression=gzip\nrebuild=%s\npulled_at=%s\n' \
+          printf 'image=%s\nimage_id=%s\narchitecture=%s\ncompression=gzip\nrebuild=%s\nparts_total=%s\npulled_at=%s\n' \
             "$IMAGE" "$ID" "$ARCH" \
             'cat spark-vllm.part.* | gunzip | docker load' \
+            "$(ls -1 spark-vllm.part.* | wc -l)" \
             "$(date -u +%FT%TZ)" > METADATA.txt
           cat METADATA.txt
-          cat SHA256SUMS
+          du -sh "$OUT"
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          OUT="$RUNNER_TEMP/out"
           TAG="img-$(date -u +%Y%m%d-%H%M%S)"
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "spark-vllm-b12x $TAG" \
-            --notes "arm64 image export. Parts are gzip streams: cat parts | gunzip | docker load. See METADATA.txt / SHA256SUMS." \
-            out/spark-vllm.part.* out/SHA256SUMS out/METADATA.txt
+            --notes "arm64 image export, gzip streams split into parts. Rebuild: cat spark-vllm.part.* | gunzip | docker load" \
+            "$OUT"/spark-vllm.part.* "$OUT"/SHA256SUMS "$OUT"/METADATA.txt
           echo "### Published: $TAG" >> "$GITHUB_STEP_SUMMARY"
           gh release view "$TAG" --repo "${{ github.repository }}" --json assets \
-            -q '.assets[] | "\(.name)  \(.size) bytes"'
+            -q '.assets[] | "\(.name)  \(.size) bytes"' >> "$GITHUB_STEP_SUMMARY"
